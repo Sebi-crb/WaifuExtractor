@@ -43,6 +43,7 @@ waifu-extract "/path/to/Season 1"          # interactive: asks for everything
 waifu-extract "/path/to/show" --list       # just show who speaks how much
 waifu-extract ep01.mkv -c Aqua -m audio -O clips -y
 waifu-extract "/path/to/show" -c Kaz,Kazuma -m video -O strip --fast
+waifu-extract "/path/to/show" -c Megumin,Megu -a 90s -m audio -O clips --normalize -y
 ```
 
 Run it with no options (or just a path) for the interactive mode: arrow-key menus,
@@ -50,10 +51,12 @@ checkboxes, and a fuzzy-search list for characters. It asks, in order:
 
 1. **Character**: type to search, Tab to tick several (spelling variants like *Kaz* +
    *Kazuma*). Close spellings are offered afterwards, already ticked.
-2. **Audio or video**, then **clips or one strip**.
-3. **Accurate or fast** video cuts (video only).
-4. **Audio effects** (checklist, see below).
-5. **Audio track** (Japanese preselected).
+2. **How much**: everything, *30 min* (fine-tuning), *90 s* (zero-shot cloning) or a custom
+   amount (`45s`, `10m`, `1h30m`, `1:30`).
+3. **Audio or video**, then **clips or one strip**.
+4. **Accurate or fast** video cuts (video only).
+5. **Audio effects** (checklist, see below).
+6. **Audio track** (Japanese preselected).
 
 A summary panel shows what will happen before anything starts; progress bars show each
 episode's current step. Every question has a matching flag (`--help`), and with
@@ -80,6 +83,15 @@ doubles as transcripts for voice-cloning datasets.
 - Lines that overlap another speaker by more than 0.15 s are skipped unless `--keep-overlap`.
 - Each line is padded by `--pad` (0.1 s) and lines closer than `--merge-gap` (0.3 s) are joined.
 
+### Choosing an amount
+
+With `--amount` (or the *How much?* question), clips are picked for voice cloning rather than
+taken from the start: 3–12 s clips first (long enough to carry the voice, short enough to be
+one utterance), then 1.5–20 s, then the rest. Within each group it takes turns across episodes
+and spreads picks through each episode, for varied emotion and recording conditions. The pick
+is deterministic, so the same settings always give the same clips. `--limit N` still exists
+for a quick preview of the first N clips.
+
 ### Video cuts
 
 - `--accurate` (default) re-encodes with x264, or `--encoder vaapi` for AMD/Intel GPUs.
@@ -91,6 +103,9 @@ doubles as transcripts for voice-cloning datasets.
 The first scan of a file reads it completely (subtitles are interleaved with the video),
 which is slow over network shares. Extracted subtitles are cached in
 `~/.cache/waifu-extractor`, so later runs on the same files start instantly.
+
+For audio, episodes with up to 30 clips are cut by seeking straight to each clip instead of
+decoding the whole track (90 s of Megumin across 19 episodes: 15 s instead of ~8 min).
 
 ## Limits
 

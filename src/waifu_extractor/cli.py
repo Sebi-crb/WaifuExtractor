@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from . import __version__, cutter, fx, ui
 from .probe import MediaInfo, Stream, collect_files, probe
-from .segments import NameStats, Segment, build_segments, name_catalog
+from .segments import NameStats, Segment, build_segments, name_catalog, pick_for_cloning
 from .subs import Line, Track, best_track, extract_subs, load_tracks
 
 
@@ -28,6 +29,10 @@ class Episode:
     @property
     def lines(self) -> list[Line]:
         return self.track.lines if self.track else []
+
+
+# Up to this many clips, seek to each one instead of decoding the episode's whole audio track.
+SEEK_MAX_CLIPS = 30
 
 
 class Abort(Exception):
@@ -44,6 +49,54 @@ def fmt_dur(seconds: float) -> str:
 
 def fmt_ts(seconds: float) -> str:
     return f"{int(seconds // 60):02d}m{seconds % 60:06.3f}s"
+
+
+DURATION = re.compile(r"^(?:(?P<h>\d+(?:\.\d+)?)h)?(?:(?P<m>\d+(?:\.\d+)?)m(?:in)?)?(?:(?P<s>\d+(?:\.\d+)?)s?)?$")
+
+
+def parse_duration(text: str) -> float | None:
+    """'90', '90s', '1.5m', '10min', '1h30m', '1:30', '1:02:00' -> seconds. 'all' / '' -> None (everything)."""
+    text = text.strip().lower().replace(" ", "")
+    if text in ("", "all", "everything"):
+        return None
+    if ":" in text:
+        parts = [float(p) for p in text.split(":")]
+        return sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
+    m = DURATION.match(text)
+    if not m or not any(m.groupdict().values()):
+        raise ValueError(text)
+    return sum(float(m[k] or 0) * f for k, f in (("h", 3600), ("m", 60), ("s", 1)))
+
+
+def valid_duration(text: str) -> bool:
+    try:
+        value = parse_duration(text)
+    except ValueError:
+        return False
+    return value is None or value > 0
+
+
+# Presets for the amount question: (seconds, label, what it's good for)
+AMOUNT_PRESETS = [(30 * 60, "30 min", "fine-tuning a voice model"), (90, "90 s", "zero-shot voice cloning")]
+
+
+def pick_amount(args, available: float) -> float | None:
+    """Seconds of audio wanted, or None for everything."""
+    if args.amount is not None:
+        try:
+            return parse_duration(args.amount)
+        except ValueError:
+            raise Abort(f"can't read --amount {args.amount!r}; use e.g. 90s, 10m, 1h30m or all") from None
+    if not ui.interactive():
+        return None
+    choices: list[tuple[object, str]] = [(None, f"Everything   {fmt_dur(available)}")]
+    choices += [(secs, f"{label:<12} {use}") for secs, label, use in AMOUNT_PRESETS if secs < available]
+    choices.append(("custom", "Custom…      type an amount"))
+    picked = ui.select("How much?", choices, default=None)
+    if picked != "custom":
+        return picked
+    return parse_duration(ui.text("Amount:", validate=valid_duration, invalid="Try 45s, 10m, 1h30m or 1:30",
+                                  instruction="e.g. 45s, 10m, 1h30m, 1:30"))
 
 
 def safe_name(text: str) -> str:
@@ -263,7 +316,10 @@ def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: st
                 wav = None
                 if mode == "audio" or effects:
                     status(ep.label, f"decoding {audio.language or 'audio'} track")
-                    wav = cutter.decode_audio(ep.info, audio, work / f"{ep.label}.wav", args.mono)
+                    if len(segs) <= SEEK_MAX_CLIPS:
+                        wav = cutter.decode_spans(ep.info, audio, segs, work / f"{ep.label}.wav", args.mono)
+                    else:
+                        wav = cutter.decode_audio(ep.info, audio, work / f"{ep.label}.wav", args.mono)
                     if effects & fx.SEPARATIONS:
                         raw, wav = wav, fx.process_excerpts(wav, segs, audio.start_time, effects, work,
                                                             args.mono, lambda m: status(ep.label, m))
@@ -366,6 +422,8 @@ def parse_args(argv):
                    help="also use lines credited to several speakers at once (e.g. 'Aqua & Kazuma')")
     p.add_argument("--keep-overlap", action="store_true",
                    help="keep lines that overlap another speaker's line (dropped by default)")
+    p.add_argument("-a", "--amount", help="how much audio to take, e.g. 90s, 10m, 1h30m or all (default: all). "
+                   "Picks clone-friendly 3-12 s clips spread across episodes")
     p.add_argument("--limit", type=int, help="only extract the first N clips (handy for a preview)")
     p.add_argument("-j", "--jobs", type=int, default=3, help="files scanned in parallel (default 3)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
@@ -416,6 +474,20 @@ def run(args) -> None:
     keys = {p.display.casefold() for p in picked}
     name = max(picked, key=lambda p: (len(p.display), p.solo)).display
 
+    plan = []
+    for ep in named:
+        segs = build_segments(ep.lines, keys, pad=args.pad, merge_gap=args.merge_gap,
+                              include_shared=args.include_shared, keep_overlap=args.keep_overlap)
+        segs = [s for s in segs if s.duration >= args.min_length]
+        if segs:
+            plan.append((ep, segs))
+    available = sum(seg.duration for _, segs in plan for seg in segs)
+    if not plan:
+        raise Abort(f"no usable lines for {name} (try --keep-overlap or --include-shared)")
+    amount = pick_amount(args, available)
+    if amount is not None and amount < available:
+        plan = pick_for_cloning(plan, amount)
+
     mode = args.mode
     if mode is None:
         need("--mode")
@@ -438,13 +510,6 @@ def run(args) -> None:
     effects = pick_effects(args)
     audio_pref = pick_audio(args, named[0].info)
 
-    plan = []
-    for ep in named:
-        segs = build_segments(ep.lines, keys, pad=args.pad, merge_gap=args.merge_gap,
-                              include_shared=args.include_shared, keep_overlap=args.keep_overlap)
-        segs = [s for s in segs if s.duration >= args.min_length]
-        if segs:
-            plan.append((ep, segs))
     if args.limit:
         left, trimmed = args.limit, []
         for ep, segs in plan:
@@ -455,15 +520,14 @@ def run(args) -> None:
         plan = trimmed
 
     count = sum(len(s) for _, s in plan)
-    if not count:
-        raise Abort(f"no usable lines for {name} (try --keep-overlap or --include-shared)")
     seconds = sum(seg.duration for _, segs in plan for seg in segs)
     lang, idx = audio_pref
     ui.console.print()
     ui.panel([
         ("Character", f"[bold {ui.PINK}]{name}[/]" + (f" [{ui.DIM}]({', '.join(p.display for p in picked)})[/]"
                                                      if len(picked) > 1 else "")),
-        ("Lines", f"{count} clips · {fmt_dur(seconds)} · {len(plan)} episode(s)"),
+        ("Lines", f"{count} clips · {fmt_dur(seconds)} · {len(plan)} episode(s)"
+                  + (f" [{ui.DIM}]picked from {fmt_dur(available)}, 3-12 s clips first[/]" if seconds < available - 0.5 else "")),
         ("Output", ("audio .wav" if mode == "audio" else "video .mkv") + (", one strip" if output == "strip" else ", clips")
          + ("" if mode == "audio" else (", accurate cuts" if accurate else ", fast cuts"))),
         ("Effects", ", ".join(fx.EFFECTS[e] for e in fx.ORDER if e in effects) or f"[{ui.DIM}]none[/]"),

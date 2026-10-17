@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 from .subs import Line
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -78,3 +82,32 @@ def build_segments(
         else:
             merged.append(Segment(start, end, line.text))
     return merged
+
+
+# Clip lengths that work best as voice references: long enough to carry the voice,
+# short enough to be one utterance. Tiers are used in order until the budget is filled.
+CLONE_TIERS = [(3.0, 12.0), (1.5, 20.0), (0.0, float("inf"))]
+
+
+def pick_for_cloning(plan: list[tuple[T, list[Segment]]], target: float, seed: int = 0) -> list[tuple[T, list[Segment]]]:
+    """Choose about `target` seconds of clips, preferring good clone lengths and spreading them
+    across episodes (round-robin) and through each episode (seeded shuffle, so runs repeat)."""
+    rng = random.Random(seed)
+    chosen: dict[int, set[int]] = {i: set() for i in range(len(plan))}
+    total = 0.0
+    for low, high in CLONE_TIERS:
+        queues = []
+        for i, (_, segs) in enumerate(plan):
+            idx = [j for j, s in enumerate(segs) if low <= s.duration <= high and j not in chosen[i]]
+            rng.shuffle(idx)
+            queues.append((i, idx))
+        while total < target and any(q for _, q in queues):
+            for i, q in queues:
+                if q and total < target:
+                    j = q.pop()
+                    chosen[i].add(j)
+                    total += plan[i][1][j].duration
+        if total >= target:
+            break
+    return [(key, [s for j, s in enumerate(segs) if j in chosen[i]])
+            for i, (key, segs) in enumerate(plan) if chosen[i]]

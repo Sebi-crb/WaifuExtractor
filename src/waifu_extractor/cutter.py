@@ -28,6 +28,41 @@ def decode_audio(info: MediaInfo, audio: Stream, out: Path, mono: bool) -> Path:
     return out
 
 
+def decode_spans(info: MediaInfo, audio: Stream, segs: list[Segment], out: Path, mono: bool,
+                 context: float = 1.0) -> Path:
+    """Like decode_audio, but seeks to each clip (plus `context` seconds each side) instead of reading
+    the whole file. Much faster over a network share when an episode only has a few clips.
+    The wav keeps episode timing: gaps are silence, and it ends after the last clip."""
+    rate, channels = 48000, 1 if mono else 2
+    frame = channels * 2
+    spans: list[list[float]] = []
+    for seg in segs:
+        a, b = max(0.0, seg.start - context), seg.end + context
+        if spans and a <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    with wave.open(str(out), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        pos = 0
+        for a, b in spans:
+            pcm = subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(info.path),
+                 "-map", f"0:a:{audio.kind_index}", "-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-"],
+                capture_output=True, check=True).stdout
+            start = max(0, int((a - audio.start_time) * rate))
+            if start > pos:
+                w.writeframes(b"\0" * ((start - pos) * frame))
+                pos = start
+            elif start < pos:  # overlaps what's written already
+                pcm = pcm[(pos - start) * frame:]
+            w.writeframes(pcm)
+            pos += len(pcm) // frame
+    return out
+
+
 class WavSource:
     """Random access into a decoded episode wav. `offset` is the audio stream's start time."""
 

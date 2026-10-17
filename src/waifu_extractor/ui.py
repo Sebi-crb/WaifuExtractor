@@ -167,6 +167,11 @@ def search(message: str, choices: Sequence[tuple[Any, str]], *, multiselect: boo
     ).execute()
 
 
+def text(message: str, *, validate: Callable[[str], bool], invalid: str, instruction: str = "") -> str:
+    return inquirer.text(message, validate=validate, invalid_message=invalid, instruction=instruction,
+                         style=PROMPT_STYLE, qmark="◆", amark="◇").execute()
+
+
 def confirm(message: str, default: bool = True) -> bool:
     return inquirer.confirm(message, default=default, style=PROMPT_STYLE, qmark="◆", amark="◇").execute()
 
