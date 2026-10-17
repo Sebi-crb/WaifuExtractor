@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import cutter
+from . import cutter, fx
 from .probe import MediaInfo, Stream, collect_files, probe
 from .segments import NameStats, Segment, build_segments, name_catalog
 from .subs import Line, Track, best_track, extract_subs, load_tracks
@@ -197,6 +197,28 @@ def pick_character(args, catalog: list[NameStats]) -> list[NameStats]:
     return picked
 
 
+def pick_effects(args) -> set[str]:
+    flags = {"music": args.remove_music, "dereverb": args.dereverb, "normalize": args.normalize}
+    missing = fx.missing()
+    if any(v is not None for v in flags.values()) or not interactive():
+        effects = {e for e, on in flags.items() if on}
+    else:
+        print("\nAudio effects? Numbers, comma-separated, or Enter for none:")
+        for i, e in enumerate(fx.ORDER, 1):
+            note = f"   [not installed: {missing[e]}]" if e in missing else ""
+            print(f"  {i}) {fx.EFFECTS[e]}{note}")
+        while True:
+            raw = input("> ").strip()
+            try:
+                effects = {fx.ORDER[int(p) - 1] for p in raw.split(",") if p.strip()}
+                break
+            except (ValueError, IndexError):
+                print("  pick numbers from the list")
+    for e in effects & missing.keys():
+        die(f"{fx.EFFECTS[e]} is not installed: {missing[e]}")
+    return effects
+
+
 def default_audio(info: MediaInfo) -> Stream:
     return next((a for a in info.audio if a.language == "jpn"), None) \
         or next((a for a in info.audio if a.default), None) or info.audio[0]
@@ -238,7 +260,7 @@ def unique_dir(base: Path) -> Path:
 # --- extraction ------------------------------------------------------------
 
 def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: str, output: str,
-            accurate: bool, isolate: bool, audio_pref: tuple[str | None, int]) -> Path:
+            accurate: bool, effects: set[str], audio_pref: tuple[str | None, int]) -> Path:
     outdir = unique_dir(args.out / f"{safe_name(name)}_{mode}_{output}")
     work = Path(tempfile.mkdtemp(prefix=".work-", dir=outdir))
     clips_dir = outdir if output == "clips" else work / "parts"
@@ -266,22 +288,25 @@ def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: st
                 continue
 
             wav = None
-            if mode == "audio" or isolate:
+            if mode == "audio" or effects:
                 print(f"  {ep.label}: decoding audio ({audio.label()})...")
                 wav = cutter.decode_audio(ep.info, audio, work / f"{ep.label}.wav", args.mono)
-                if isolate:
-                    print(f"  {ep.label}: isolating vocals with Demucs...")
-                    raw, wav = wav, cutter.isolate_vocals(wav, work / "demucs", args.mono)
+                if effects & fx.SEPARATIONS:
+                    raw, wav = wav, fx.process_excerpts(wav, segs, audio.start_time, effects, work,
+                                                        args.mono, ep.label)
                     raw.unlink()
-                    shutil.rmtree(work / "demucs", ignore_errors=True)
 
-            src = cutter.WavSource(wav, audio.start_time) if mode == "audio" else None
+            src = cutter.WavSource(wav, audio.start_time) if wav else None
             for n, seg in enumerate(segs, 1):
                 clip = f"{ep.label}_{n:04d}_{fmt_ts(seg.start)}.{ext}"
                 row = [clip if output == "clips" else strip_path.name, ep.label, ep.info.path.name,
                        f"{seg.start:.3f}", f"{seg.end:.3f}", f"{seg.duration:.3f}"]
+                frames = b""
                 if src:
                     frames = src.read(seg.start, seg.end)
+                    if "normalize" in effects:
+                        frames = fx.normalize_frames(frames, src.params, work, args.loudness)
+                if mode == "audio":
                     if output == "clips":
                         cutter.write_wav(clips_dir / clip, src.params, frames)
                     else:
@@ -290,15 +315,20 @@ def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: st
                             strip_wav.setparams(src.params)
                         strip_wav.writeframes(frames + src.silence(args.gap))
                 else:
+                    # With effects, the clip's processed audio goes in as its own wav starting at seg.start.
+                    clip_audio = None
+                    if src:
+                        clip_audio = work / "clip-audio.wav"
+                        cutter.write_wav(clip_audio, src.params, frames)
                     cutter.cut_video(ep.info, seg, clips_dir / clip, video=video, audio=audio,
                                      accurate=accurate, encoder=args.encoder,
-                                     vocals=wav, vocals_offset=audio.start_time)
+                                     audio_file=clip_audio, audio_offset=seg.start)
                     parts.append(clips_dir / clip)
                 if output == "strip":
                     # Fast video cuts start on a keyframe, so the clip can be longer than the line.
-                    length = seg.duration if src else cutter.duration(parts[-1])
+                    length = seg.duration if mode == "audio" else cutter.duration(parts[-1])
                     row += [f"{strip_pos:.3f}", f"{strip_pos + length:.3f}"]
-                    strip_pos += length + (args.gap if src else 0)
+                    strip_pos += length + (args.gap if mode == "audio" else 0)
                 writer.writerow(row + [seg.text])
                 done += 1
                 print(f"\r  {ep.label}: {n}/{len(segs)} clips   (total {done}/{total})", end="", flush=True)
@@ -341,8 +371,14 @@ def parse_args(argv):
     p.add_argument("--encoder", choices=["x264", "vaapi"], default="x264", help="encoder for accurate video cuts")
     p.add_argument("--audio-lang", help="audio track language, e.g. jpn or eng (default: jpn if present)")
     p.add_argument("--audio-track", type=int, help="audio track number (0 = first audio track)")
-    p.add_argument("--isolate-vocals", action=argparse.BooleanOptionalAction, default=None,
-                   help="strip music/SFX with Demucs (needs the [vocals] extra)")
+    p.add_argument("--remove-music", "--isolate-vocals", dest="remove_music", action=argparse.BooleanOptionalAction,
+                   default=None, help="remove music and sound effects, keep voices (needs the [fx] extra)")
+    p.add_argument("--dereverb", action=argparse.BooleanOptionalAction, default=None,
+                   help="remove reverb/echo from the voices (needs the [fx] extra)")
+    p.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=None,
+                   help="bring every clip to the same loudness (two-pass loudnorm)")
+    p.add_argument("--loudness", type=float, default=fx.DEFAULT_LUFS,
+                   help=f"loudness target for --normalize in LUFS (default {fx.DEFAULT_LUFS:g})")
     p.add_argument("--mono", action="store_true", help="mix audio down to mono")
     p.add_argument("--pad", type=float, default=0.1, help="seconds added before and after each line (default 0.1)")
     p.add_argument("--merge-gap", type=float, default=0.3,
@@ -405,11 +441,7 @@ def run(args) -> None:
                                             ("fast", "stream copy, instant, snaps to keyframes")], "accurate")
         accurate = cut != "fast"
 
-    isolate = args.isolate_vocals
-    if isolate is None:
-        isolate = interactive() and cutter.demucs_available() and yes_no("Isolate vocals with Demucs (slow)?", False)
-    if isolate and not cutter.demucs_available():
-        die("--isolate-vocals needs Demucs: install with  uv tool install 'waifu-extractor[vocals]'  (see README)")
+    effects = pick_effects(args)
 
     audio_pref = pick_audio(args, named[0].info)
 
@@ -435,12 +467,12 @@ def run(args) -> None:
     seconds = sum(seg.duration for _, segs in plan for seg in segs)
     print(f"\n{name} ({', '.join(p.display for p in picked)}): {count} clips, {fmt_dur(seconds)} "
           f"across {len(plan)} episode(s) -> {mode} {output}"
-          + (", vocals isolated" if isolate else "")
+          + "".join(f", {fx.EFFECTS[e].lower()}" for e in fx.ORDER if e in effects)
           + ("" if mode == "audio" else (", frame-accurate" if accurate else ", fast cut")))
     if not args.yes and interactive() and not yes_no("Start?", True):
         return
 
-    outdir = extract(args, plan, name, mode, output, accurate, isolate, audio_pref)
+    outdir = extract(args, plan, name, mode, output, accurate, effects, audio_pref)
     print(f"\nDone: {outdir}")
 
 

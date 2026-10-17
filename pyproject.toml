@@ -7,7 +7,8 @@ requires-python = ">=3.11"
 dependencies = ["pysubs2>=1.7"]
 
 [project.optional-dependencies]
-vocals = ["demucs>=4.0"]
+# audio-separator 0.47 imports onnxruntime and audioread without declaring them
+fx = ["audio-separator>=0.47", "onnxruntime", "audioread"]
 
 [project.scripts]
 waifu-extract = "waifu_extractor.cli:main"

@@ -17,17 +17,24 @@ uv tool install git+https://github.com/Sebi-crb/WaifuExtractor
 uv sync && uv run waifu-extract --help
 ```
 
-### Optional: vocal isolation
+### Optional: music removal and de-reverb
 
-`--isolate-vocals` runs [Demucs](https://github.com/adefossez/demucs) on each episode to
-strip music and sound effects, leaving just voices. It pulls in PyTorch:
+These run AI separation models through [audio-separator](https://github.com/nomadkaraoke/python-audio-separator)
+on each episode before cutting: BS-Roformer to remove music and sound effects, and a MelBand-Roformer
+to remove reverb and echo. They need PyTorch, best installed for your GPU first:
 
 ```sh
-uv tool install 'waifu-extractor[vocals] @ git+https://github.com/Sebi-crb/WaifuExtractor'
+uv tool install --editable . --with 'waifu-extractor[fx]'
+# then put the GPU build of PyTorch into the same environment, e.g. AMD (ROCm):
+uv pip install --python "$(uv tool dir)/waifu-extractor/bin/python" torch --index-url https://download.pytorch.org/whl/rocm7.2
+# or NVIDIA: --index-url https://download.pytorch.org/whl/cu128
+# Python 3.14 only: audio-separator pins beartype<0.19, which can't load the Roformer models there
+uv pip install --python "$(uv tool dir)/waifu-extractor/bin/python" 'beartype>=0.22'
 ```
 
-For GPU speed, install the PyTorch build for your card (CUDA or ROCm) into the same
-environment first; on CPU it works but takes several minutes per episode.
+On CPU they work but take several minutes per episode. Models download to
+`~/.cache/waifu-extractor/models` on first use. On RDNA2 cards other than the 6800/6900
+(e.g. RX 6600/6650/6700) the app sets `HSA_OVERRIDE_GFX_VERSION=10.3.0` automatically.
 
 ## Usage
 
@@ -40,8 +47,16 @@ waifu-extract "/path/to/show" -c Kaz,Kazuma -m video -O strip --fast
 
 Interactive mode asks, in order: character (several spelling variants can be picked at
 once, and it offers similar names like *Kaz* / *Kazuma*), audio or video, clips or strip,
-fast or accurate video cuts, vocal isolation (if Demucs is installed) and the audio track
-(Japanese by default). Each question has a matching flag, see `--help`.
+fast or accurate video cuts, audio effects and the audio track (Japanese by default).
+
+The effects menu is a checklist of three; effects that aren't installed are marked:
+
+- **Remove music and sound effects** (`--remove-music`)
+- **Remove reverb and echo** (`--dereverb`)
+- **Normalize loudness** (`--normalize`, target `--loudness -20` LUFS): two-pass loudnorm
+  per clip, so every clip has the same volume.
+
+Effects also apply to video output: the clip gets the processed soundtrack. Each question has a matching flag, see `--help`.
 
 Output lands in `./waifu-extract/<Character>_<audio|video>_<clips|strip>/` together with
 `metadata.tsv`: source episode, timestamps and the subtitle text of every clip, which
@@ -72,7 +87,7 @@ which is slow over network shares. Extracted subtitles are cached in
 - Only works when a subtitle track names its speakers. Image subtitles (PGS/VobSub) and
   most official/streaming subtitles don't.
 - Subtitle timing is made for reading, so clips can include a little silence or a
-  neighbouring sound; `--isolate-vocals` and `--min-length` help for voice datasets.
+  neighbouring sound; `--remove-music` and `--min-length` help for voice datasets.
 - Timings match the audio the subtitles were made for (usually Japanese); the dub can drift.
 
 Only use it on media you own.

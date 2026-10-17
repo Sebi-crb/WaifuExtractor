@@ -1,10 +1,8 @@
-"""ffmpeg/Demucs work: decode audio, isolate vocals, cut clips, concatenate strips."""
+"""ffmpeg work: decode audio, cut clips, concatenate strips."""
 
 from __future__ import annotations
 
-import importlib.util
 import subprocess
-import sys
 import wave
 from pathlib import Path
 
@@ -14,14 +12,10 @@ from .segments import Segment
 VAAPI_DEVICE = "/dev/dri/renderD128"
 
 
-def run(cmd: list[str]) -> None:
-    res = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd: list[str], env: dict[str, str] | None = None) -> None:
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if res.returncode != 0:
         raise RuntimeError(f"{cmd[0]} failed:\n{res.stderr.strip()[-2000:]}")
-
-
-def demucs_available() -> bool:
-    return importlib.util.find_spec("demucs") is not None
 
 
 # --- audio -----------------------------------------------------------------
@@ -31,16 +25,6 @@ def decode_audio(info: MediaInfo, audio: Stream, out: Path, mono: bool) -> Path:
     # Fixed rate/layout so wavs from different episodes can be joined into one strip.
     run(["ffmpeg", "-v", "error", "-y", "-i", str(info.path), "-map", f"0:a:{audio.kind_index}",
          "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "1" if mono else "2", str(out)])
-    return out
-
-
-def isolate_vocals(wav: Path, workdir: Path, mono: bool) -> Path:
-    """Run Demucs on the full episode and return the vocals stem, resampled back to the decode format."""
-    run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs", "-o", str(workdir), str(wav)])
-    stem = workdir / "htdemucs" / wav.stem / "vocals.wav"
-    out = wav.with_name(wav.stem + ".vocals.wav")
-    run(["ffmpeg", "-v", "error", "-y", "-i", str(stem), "-c:a", "pcm_s16le", "-ar", "48000",
-         "-ac", "1" if mono else "2", str(out)])
     return out
 
 
@@ -85,17 +69,18 @@ def cut_video(
     audio: Stream,
     accurate: bool,
     encoder: str,
-    vocals: Path | None = None,
-    vocals_offset: float = 0.0,
+    audio_file: Path | None = None,
+    audio_offset: float = 0.0,
 ) -> None:
+    """Cut one clip. `audio_file` replaces the soundtrack with a processed episode wav."""
     cmd = ["ffmpeg", "-v", "error", "-y"]
     if accurate and encoder == "vaapi":
         cmd += ["-vaapi_device", VAAPI_DEVICE]
     cmd += ["-ss", f"{seg.start:.3f}", "-i", str(info.path)]
-    if vocals:
-        cmd += ["-ss", f"{max(0.0, seg.start - vocals_offset):.3f}", "-i", str(vocals)]
+    if audio_file:
+        cmd += ["-ss", f"{max(0.0, seg.start - audio_offset):.3f}", "-i", str(audio_file)]
     cmd += ["-t", f"{seg.duration:.3f}", "-map", f"0:v:{video.kind_index}",
-            "-map", "1:a:0" if vocals else f"0:a:{audio.kind_index}"]
+            "-map", "1:a:0" if audio_file else f"0:a:{audio.kind_index}"]
 
     if not accurate:
         cmd += ["-c:v", "copy"]
@@ -104,7 +89,7 @@ def cut_video(
     else:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
 
-    if accurate or vocals:
+    if accurate or audio_file:
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c:a", "copy"]
