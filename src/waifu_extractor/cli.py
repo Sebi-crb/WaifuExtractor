@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import shutil
+import subprocess
 import sys
 import tempfile
 import wave
@@ -12,12 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import cutter, fx
+from . import __version__, cutter, fx, ui
 from .probe import MediaInfo, Stream, collect_files, probe
 from .segments import NameStats, Segment, build_segments, name_catalog
 from .subs import Line, Track, best_track, extract_subs, load_tracks
-
-SHOWN_NAMES = 40
 
 
 @dataclass
@@ -31,12 +30,11 @@ class Episode:
         return self.track.lines if self.track else []
 
 
+class Abort(Exception):
+    """Stop with an error message."""
+
+
 # --- small helpers ---------------------------------------------------------
-
-def die(msg: str) -> None:
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(1)
-
 
 def fmt_dur(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
@@ -52,61 +50,34 @@ def safe_name(text: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in text).strip("_") or "character"
 
 
-def interactive() -> bool:
-    return sys.stdin.isatty()
-
-
-def choose(prompt: str, options: list[tuple[str, str]], default: str) -> str:
-    """Numbered menu; returns the chosen option's value."""
-    print(f"\n{prompt}")
-    for i, (value, label) in enumerate(options, 1):
-        print(f"  {i}) {label}{'  (default)' if value == default else ''}")
-    values = [v for v, _ in options]
-    while True:
-        ans = input("> ").strip().lower()
-        if not ans:
-            return default
-        if ans.isdigit() and 1 <= int(ans) <= len(options):
-            return values[int(ans) - 1]
-        if ans in values:
-            return ans
-        print("  pick a number from the list")
-
-
-def yes_no(prompt: str, default: bool) -> bool:
-    ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}] ").strip().lower()
-    return default if not ans else ans.startswith("y")
-
-
-def need(value, flag: str):
+def need(flag: str) -> None:
     """A choice that wasn't given as a flag and can't be asked because there's no terminal."""
-    if value is None and not interactive():
-        die(f"{flag} is required when not running in a terminal")
-    return value
+    if not ui.interactive():
+        raise Abort(f"{flag} is required when not running in a terminal")
 
 
 # --- scanning --------------------------------------------------------------
 
 def scan(files: list[Path], jobs: int) -> list[Episode]:
-    print(f"Scanning {len(files)} file(s) for subtitle tracks (first scan reads each whole file)...")
-
     def work(path: Path) -> tuple[MediaInfo, list[Track], bool]:
         info = probe(path)
         sub_files, cached = extract_subs(info)
         return info, load_tracks(info, sub_files), cached
 
     results: dict[Path, tuple[MediaInfo, list[Track]]] = {}
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    cached_count = 0
+    with ui.progress(transient=True) as bar, ThreadPoolExecutor(max_workers=jobs) as pool:
+        task = bar.add_task("Reading subtitles", total=len(files))
         futures = {pool.submit(work, p): p for p in files}
-        for n, fut in enumerate(as_completed(futures), 1):
+        for fut in as_completed(futures):
             path = futures[fut]
             try:
                 info, tracks, cached = fut.result()
+                results[path] = (info, tracks)
+                cached_count += cached
             except Exception as exc:  # one broken file shouldn't stop the batch
-                print(f"  [{n}/{len(files)}] {path.name}: skipped ({exc})")
-                continue
-            results[path] = (info, tracks)
-            print(f"  [{n}/{len(files)}] {info.label}{' (cached)' if cached else ''}")
+                ui.warn(f"{path.name}: skipped ({exc})")
+            bar.advance(task)
 
     episodes, seen = [], set()
     for path in files:
@@ -118,41 +89,45 @@ def scan(files: list[Path], jobs: int) -> list[Episode]:
             label += "_2"
         seen.add(label)
         episodes.append(Episode(info, label, best_track(tracks)))
+    fresh = len(results) - cached_count
+    ui.ok(f"Scanned {len(results)} file(s)" + (f" [{ui.DIM}]({cached_count} cached, {fresh} read)[/]" if cached_count else ""))
     return episodes
 
 
-def print_scan(episodes: list[Episode]) -> None:
-    print("\nSpeaker-named subtitle track per episode:")
-    for ep in episodes:
-        if ep.track:
-            print(f"  {ep.label:<12} {ep.track.named:>4} named lines  <- {ep.track.stream.label()}")
-        else:
-            subs = len(ep.info.text_subs)
-            print(f"  {ep.label:<12} no speaker names in {subs} text track(s) - skipped")
+def report_scan(episodes: list[Episode], verbose: bool) -> None:
+    named = [e for e in episodes if e.track]
+    if verbose:
+        ui.table([("Episode", "left"), ("Named lines", "right"), ("Subtitle track", "left")],
+                 [(e.label, e.track.named if e.track else "-", e.track.stream.label() if e.track
+                   else f"[{ui.DIM}]no speaker names in {len(e.info.text_subs)} text track(s)[/]") for e in episodes])
+        ui.console.print()
+    tracks = {e.track.stream.title or e.track.stream.label() for e in named}
+    if named:
+        ui.ok(f"{len(named)} episode(s) have speaker names [{ui.DIM}]· from {', '.join(sorted(tracks))}[/]")
+    for e in episodes:
+        if not e.track:
+            ui.warn(f"{e.label}: no subtitle track names its speakers, skipped")
 
 
-def print_catalog(catalog: list[NameStats], limit: int | None = None) -> None:
-    shown = catalog[:limit] if limit else catalog
-    width = max((len(s.display) for s in shown), default=4)
-    print("\nCharacters found:")
-    for i, st in enumerate(shown, 1):
-        shared = f"  (+{st.shared} shared)" if st.shared else ""
-        print(f"  {i:>3}) {st.display:<{width}}  {st.solo:>5} lines  {fmt_dur(st.seconds):>8}  "
-              f"{len(st.episodes):>3} ep{shared}")
-    if limit and len(catalog) > limit:
-        print(f"  ... {len(catalog) - limit} more with fewer lines (type a name to pick one of them)")
+def report_catalog(catalog: list[NameStats]) -> None:
+    ui.table([("#", "right"), ("Character", "left"), ("Lines", "right"), ("Talk time", "right"),
+              ("Episodes", "right"), ("Shared", "right")],
+             [(i, st.display, st.solo, fmt_dur(st.seconds), len(st.episodes), st.shared or "")
+              for i, st in enumerate(catalog, 1)])
 
 
 # --- choices ---------------------------------------------------------------
 
+def is_variant(a: str, b: str) -> bool:
+    """Kaz / Kazuma: the shorter name (3+ letters) starts the longer and the rest is plain letters.
+    Rules out combined or labelled credits such as 'Aqua-Kaz' or 'Aqua(ReviewA)'."""
+    short, long = sorted((a, b), key=len)
+    return len(short) >= 3 and long != short and long.startswith(short) and long[len(short):].isalpha()
+
+
 def similar_names(chosen: set[str], catalog: list[NameStats]) -> list[NameStats]:
-    """Spelling variants such as Kaz / Kazuma: one name is a prefix of the other."""
-    out = []
-    for st in catalog:
-        key = st.display.casefold()
-        if key not in chosen and any(key.startswith(c) or c.startswith(key) for c in chosen if len(c) >= 3 and len(key) >= 3):
-            out.append(st)
-    return out
+    return [st for st in catalog if st.display.casefold() not in chosen
+            and any(is_variant(st.display.casefold(), c) for c in chosen)]
 
 
 def resolve_names(raw: str, catalog: list[NameStats]) -> list[NameStats]:
@@ -166,56 +141,50 @@ def resolve_names(raw: str, catalog: list[NameStats]) -> list[NameStats]:
         elif part.casefold() in by_key:
             picked.append(by_key[part.casefold()])
         else:
-            raise ValueError(part)
+            raise Abort(f"no speaker called {part!r} - run with --list to see the names")
     return picked
+
+
+def character_title(st: NameStats, width: int) -> str:
+    return f"{st.display:<{width}}  {st.solo:>5} lines  {fmt_dur(st.seconds):>8}  {len(st.episodes):>3} ep"
 
 
 def pick_character(args, catalog: list[NameStats]) -> list[NameStats]:
     if args.character:
-        try:
-            picked = resolve_names(",".join(args.character), catalog)
-        except ValueError as exc:
-            die(f"no speaker called {exc} - run with --list to see the names")
+        picked = resolve_names(",".join(args.character), catalog)
         for st in similar_names({p.display.casefold() for p in picked}, catalog):
-            print(f"note: similar name {st.display!r} ({st.solo} lines) not included; add it with --character")
+            ui.warn(f"Similar name {st.display!r} ({st.solo} lines) not included; add it with -c")
         return picked
 
-    need(None, "--character")
-    print_catalog(catalog, SHOWN_NAMES)
-    while True:
-        raw = input("\nWhich character? Numbers or names, comma-separated for spelling variants (e.g. 2,7): ")
-        try:
-            picked = resolve_names(raw, catalog)
-        except ValueError as exc:
-            print(f"  no speaker called {exc}")
-            continue
-        if picked:
-            break
-    for st in similar_names({p.display.casefold() for p in picked}, catalog):
-        if yes_no(f"Also include {st.display!r} ({st.solo} lines, {len(st.episodes)} ep)? Looks like the same character.", True):
-            picked.append(st)
-    return picked
+    need("--character")
+    width = min(24, max(len(s.display) for s in catalog))
+    by_key = {st.display.casefold(): st for st in catalog}
+    keys = ui.search("Which character?", [(key, character_title(st, width)) for key, st in by_key.items()],
+                     answer=lambda titles: ", ".join(t[:width].strip() for t in titles))
+    similar = similar_names(set(keys), catalog)
+    if similar:
+        keys += ui.checkbox(
+            "These look like the same character under another spelling. Include them?",
+            [(st.display.casefold(), character_title(st, width)) for st in similar],
+            checked={st.display.casefold() for st in similar},
+            answer=lambda titles: ", ".join(t[:width].strip() for t in titles) or "none",
+        )
+    return [by_key[k] for k in keys]
 
 
 def pick_effects(args) -> set[str]:
     flags = {"music": args.remove_music, "dereverb": args.dereverb, "normalize": args.normalize}
     missing = fx.missing()
-    if any(v is not None for v in flags.values()) or not interactive():
+    if any(v is not None for v in flags.values()) or not ui.interactive():
         effects = {e for e, on in flags.items() if on}
     else:
-        print("\nAudio effects? Numbers, comma-separated, or Enter for none:")
-        for i, e in enumerate(fx.ORDER, 1):
-            note = f"   [not installed: {missing[e]}]" if e in missing else ""
-            print(f"  {i}) {fx.EFFECTS[e]}{note}")
-        while True:
-            raw = input("> ").strip()
-            try:
-                effects = {fx.ORDER[int(p) - 1] for p in raw.split(",") if p.strip()}
-                break
-            except (ValueError, IndexError):
-                print("  pick numbers from the list")
+        effects = set(ui.checkbox(
+            "Audio effects?",
+            [(e, fx.EFFECTS[e]) for e in fx.ORDER],
+            unavailable={e: "not installed, see README" for e in missing},
+        ))
     for e in effects & missing.keys():
-        die(f"{fx.EFFECTS[e]} is not installed: {missing[e]}")
+        raise Abort(f"{fx.EFFECTS[e]} is not installed: {missing[e]}")
     return effects
 
 
@@ -227,13 +196,13 @@ def default_audio(info: MediaInfo) -> Stream:
 def pick_audio(args, sample: MediaInfo) -> tuple[str | None, int]:
     """Audio preference as (language, index); language wins when an episode has it."""
     if not sample.audio:
-        die(f"{sample.path.name} has no audio track")
+        raise Abort(f"{sample.path.name} has no audio track")
     if args.audio_lang or args.audio_track is not None:
         return args.audio_lang, args.audio_track or 0
     default = default_audio(sample)
-    if len(sample.audio) > 1 and interactive():
-        options = [(str(a.kind_index), a.label()) for a in sample.audio]
-        idx = int(choose("Which audio track?", options, str(default.kind_index)))
+    if len(sample.audio) > 1 and ui.interactive():
+        idx = ui.select("Which audio track?", [(a.kind_index, a.label()) for a in sample.audio],
+                        default=default.kind_index)
         return sample.audio[idx].language or None, idx
     return default.language or None, default.kind_index
 
@@ -276,73 +245,78 @@ def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: st
     strip_wav: wave.Wave_write | None = None
     strip_pos = 0.0
     parts: list[Path] = []
-    total = sum(len(s) for _, s in plan)
-    done = 0
     try:
-        for ep, segs in plan:
-            audio = resolve_audio(ep.info, *audio_pref)
-            video = ep.info.main_video
-            if audio is None or (mode == "video" and video is None):
-                print(f"  {ep.label}: missing {'audio' if audio is None else 'video'} stream, skipped")
-                done += len(segs)
-                continue
+        with ui.progress() as bar:
+            task = bar.add_task("Starting", total=sum(len(s) for _, s in plan))
 
-            wav = None
-            if mode == "audio" or effects:
-                print(f"  {ep.label}: decoding audio ({audio.label()})...")
-                wav = cutter.decode_audio(ep.info, audio, work / f"{ep.label}.wav", args.mono)
-                if effects & fx.SEPARATIONS:
-                    raw, wav = wav, fx.process_excerpts(wav, segs, audio.start_time, effects, work,
-                                                        args.mono, ep.label)
-                    raw.unlink()
+            def status(label: str, msg: str) -> None:
+                bar.update(task, description=f"[bold]{label}[/] [{ui.DIM}]{msg}[/]")
 
-            src = cutter.WavSource(wav, audio.start_time) if wav else None
-            for n, seg in enumerate(segs, 1):
-                clip = f"{ep.label}_{n:04d}_{fmt_ts(seg.start)}.{ext}"
-                row = [clip if output == "clips" else strip_path.name, ep.label, ep.info.path.name,
-                       f"{seg.start:.3f}", f"{seg.end:.3f}", f"{seg.duration:.3f}"]
-                frames = b""
-                if src:
-                    frames = src.read(seg.start, seg.end)
-                    if "normalize" in effects:
-                        frames = fx.normalize_frames(frames, src.params, work, args.loudness)
-                if mode == "audio":
-                    if output == "clips":
-                        cutter.write_wav(clips_dir / clip, src.params, frames)
-                    else:
-                        if strip_wav is None:
-                            strip_wav = wave.open(str(strip_path), "wb")
-                            strip_wav.setparams(src.params)
-                        strip_wav.writeframes(frames + src.silence(args.gap))
-                else:
-                    # With effects, the clip's processed audio goes in as its own wav starting at seg.start.
-                    clip_audio = None
+            for ep, segs in plan:
+                audio = resolve_audio(ep.info, *audio_pref)
+                video = ep.info.main_video
+                if audio is None or (mode == "video" and video is None):
+                    ui.warn(f"{ep.label}: missing {'audio' if audio is None else 'video'} stream, skipped")
+                    bar.advance(task, len(segs))
+                    continue
+
+                wav = None
+                if mode == "audio" or effects:
+                    status(ep.label, f"decoding {audio.language or 'audio'} track")
+                    wav = cutter.decode_audio(ep.info, audio, work / f"{ep.label}.wav", args.mono)
+                    if effects & fx.SEPARATIONS:
+                        raw, wav = wav, fx.process_excerpts(wav, segs, audio.start_time, effects, work,
+                                                            args.mono, lambda m: status(ep.label, m))
+                        raw.unlink()
+
+                status(ep.label, "cutting")
+                src = cutter.WavSource(wav, audio.start_time) if wav else None
+                for n, seg in enumerate(segs, 1):
+                    clip = f"{ep.label}_{n:04d}_{fmt_ts(seg.start)}.{ext}"
+                    row = [clip if output == "clips" else strip_path.name, ep.label, ep.info.path.name,
+                           f"{seg.start:.3f}", f"{seg.end:.3f}", f"{seg.duration:.3f}"]
+                    frames = b""
                     if src:
-                        clip_audio = work / "clip-audio.wav"
-                        cutter.write_wav(clip_audio, src.params, frames)
-                    cutter.cut_video(ep.info, seg, clips_dir / clip, video=video, audio=audio,
-                                     accurate=accurate, encoder=args.encoder,
-                                     audio_file=clip_audio, audio_offset=seg.start)
-                    parts.append(clips_dir / clip)
-                if output == "strip":
-                    # Fast video cuts start on a keyframe, so the clip can be longer than the line.
-                    length = seg.duration if mode == "audio" else cutter.duration(parts[-1])
-                    row += [f"{strip_pos:.3f}", f"{strip_pos + length:.3f}"]
-                    strip_pos += length + (args.gap if mode == "audio" else 0)
-                writer.writerow(row + [seg.text])
-                done += 1
-                print(f"\r  {ep.label}: {n}/{len(segs)} clips   (total {done}/{total})", end="", flush=True)
-            print()
-            if src:
-                src.close()
-            if wav:
-                wav.unlink(missing_ok=True)
+                        frames = src.read(seg.start, seg.end)
+                        if "normalize" in effects:
+                            frames = fx.normalize_frames(frames, src.params, work, args.loudness)
+                    if mode == "audio":
+                        if output == "clips":
+                            cutter.write_wav(clips_dir / clip, src.params, frames)
+                        else:
+                            if strip_wav is None:
+                                strip_wav = wave.open(str(strip_path), "wb")
+                                strip_wav.setparams(src.params)
+                            strip_wav.writeframes(frames + src.silence(args.gap))
+                    else:
+                        # With effects, the clip's processed audio goes in as its own wav starting at seg.start.
+                        clip_audio = None
+                        if src:
+                            clip_audio = work / "clip-audio.wav"
+                            cutter.write_wav(clip_audio, src.params, frames)
+                        cutter.cut_video(ep.info, seg, clips_dir / clip, video=video, audio=audio,
+                                         accurate=accurate, encoder=args.encoder,
+                                         audio_file=clip_audio, audio_offset=seg.start)
+                        parts.append(clips_dir / clip)
+                    if output == "strip":
+                        # Fast video cuts start on a keyframe, so the clip can be longer than the line.
+                        length = seg.duration if mode == "audio" else cutter.duration(parts[-1])
+                        row += [f"{strip_pos:.3f}", f"{strip_pos + length:.3f}"]
+                        strip_pos += length + (args.gap if mode == "audio" else 0)
+                    writer.writerow(row + [seg.text])
+                    bar.advance(task)
+                if src:
+                    src.close()
+                if wav:
+                    wav.unlink(missing_ok=True)
+                bar.console.print(f"[green]✓[/] {ep.label:<10} [{ui.DIM}]{len(segs)} clip(s)[/]")
 
-        if strip_wav:
-            strip_wav.close()
-        if mode == "video" and output == "strip" and parts:
-            print("  joining clips into one video...")
-            cutter.concat_videos(parts, strip_path)
+            if strip_wav:
+                strip_wav.close()
+            if mode == "video" and output == "strip" and parts:
+                status("strip", "joining clips into one video")
+                cutter.concat_videos(parts, strip_path)
+            bar.update(task, description="[bold green]Done[/]")
     finally:
         meta.close()
         shutil.rmtree(work, ignore_errors=True)
@@ -354,10 +328,13 @@ def extract(args, plan: list[tuple[Episode, list[Segment]]], name: str, mode: st
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="waifu-extract",
-        description="Cut one character's lines out of anime episodes, using subtitle tracks that name the speaker.",
+        description="Cut one character's lines out of anime episodes, using subtitle tracks that name the speaker. "
+                    "Run without options for the interactive mode.",
     )
-    p.add_argument("path", type=Path, help="an episode file, or a folder (searched recursively)")
+    p.add_argument("path", type=Path, nargs="?", help="an episode file, or a folder (searched recursively)")
+    p.add_argument("-V", "--version", action="version", version=f"waifu-extract {__version__}")
     p.add_argument("--list", action="store_true", help="only print the characters found and exit")
+    p.add_argument("-v", "--verbose", action="store_true", help="show which subtitle track each episode uses")
     p.add_argument("-c", "--character", action="append",
                    help="speaker name(s) or list numbers, comma-separated; repeatable (e.g. -c Kaz,Kazuma)")
     p.add_argument("-m", "--mode", choices=["audio", "video"], help="wav audio or mkv video")
@@ -399,50 +376,66 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     try:
         run(args)
-    except KeyboardInterrupt:
-        print("\ninterrupted")
+    except (KeyboardInterrupt, ui.Cancelled):
+        ui.console.print(f"\n[{ui.DIM}]Cancelled.[/]")
         sys.exit(130)
+    except Abort as exc:
+        ui.error(str(exc))
+        sys.exit(1)
 
 
 def run(args) -> None:
+    if ui.interactive() and not args.list:
+        ui.banner()
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            die(f"{tool} not found on PATH")
+            raise Abort(f"{tool} not found on PATH")
+    if args.path is None:
+        need("a path")
+        args.path = Path(ui.path("Episode file or folder:")).expanduser()
     try:
         files = collect_files(args.path)
     except FileNotFoundError:
-        die(f"{args.path} does not exist")
+        raise Abort(f"{args.path} does not exist") from None
     if not files:
-        die(f"no video files in {args.path}")
+        raise Abort(f"no video files in {args.path}")
 
     episodes = scan(files, args.jobs)
-    print_scan(episodes)
+    report_scan(episodes, args.verbose)
     named = [e for e in episodes if e.track]
     if not named:
-        die("no subtitle track in these files names its speakers, so there is nothing to cut by")
+        raise Abort("no subtitle track in these files names its speakers, so there is nothing to cut by")
     catalog = name_catalog({e.label: e.lines for e in named})
     if args.list:
-        print_catalog(catalog)
+        ui.console.print()
+        report_catalog(catalog)
         return
+    ui.console.print()
 
     picked = pick_character(args, catalog)
     keys = {p.display.casefold() for p in picked}
-    name = picked[0].display if len(picked) == 1 else max(picked, key=lambda p: len(p.display)).display
+    name = max(picked, key=lambda p: (len(p.display), p.solo)).display
 
-    mode = args.mode or need(None, "--mode") or choose(
-        "Output type?", [("audio", "audio only (.wav)"), ("video", "video with sound (.mkv)")], "audio")
-    output = args.output or need(None, "--output") or choose(
-        "Cut or one strip?", [("clips", "a folder with one clip per line"), ("strip", "one long file")], "clips")
+    mode = args.mode
+    if mode is None:
+        need("--mode")
+        mode = ui.select("What should come out?", [("audio", "Audio only   .wav, for voice clips and datasets"),
+                                                   ("video", "Video        .mkv with picture and sound")], "audio")
+    output = args.output
+    if output is None:
+        need("--output")
+        output = ui.select("Cut how?", [("clips", "Clips        a folder with one file per line"),
+                                        ("strip", "One strip    every line back to back in one file")], "clips")
     accurate = True
     if mode == "video":
         cut = args.cut
-        if cut is None and interactive():
-            cut = choose("Video cutting?", [("accurate", "re-encode, frame-accurate (slower)"),
-                                            ("fast", "stream copy, instant, snaps to keyframes")], "accurate")
+        if cut is None and ui.interactive():
+            cut = ui.select("Video cuts?", [("accurate", "Accurate     re-encode, cuts land exactly on the line"),
+                                            ("fast", "Fast         no re-encode, cuts snap to keyframes")],
+                            "accurate")
         accurate = cut != "fast"
 
     effects = pick_effects(args)
-
     audio_pref = pick_audio(args, named[0].info)
 
     plan = []
@@ -463,17 +456,29 @@ def run(args) -> None:
 
     count = sum(len(s) for _, s in plan)
     if not count:
-        die(f"no usable lines for {name} (try --keep-overlap or --include-shared)")
+        raise Abort(f"no usable lines for {name} (try --keep-overlap or --include-shared)")
     seconds = sum(seg.duration for _, segs in plan for seg in segs)
-    print(f"\n{name} ({', '.join(p.display for p in picked)}): {count} clips, {fmt_dur(seconds)} "
-          f"across {len(plan)} episode(s) -> {mode} {output}"
-          + "".join(f", {fx.EFFECTS[e].lower()}" for e in fx.ORDER if e in effects)
-          + ("" if mode == "audio" else (", frame-accurate" if accurate else ", fast cut")))
-    if not args.yes and interactive() and not yes_no("Start?", True):
-        return
+    lang, idx = audio_pref
+    ui.console.print()
+    ui.panel([
+        ("Character", f"[bold {ui.PINK}]{name}[/]" + (f" [{ui.DIM}]({', '.join(p.display for p in picked)})[/]"
+                                                     if len(picked) > 1 else "")),
+        ("Lines", f"{count} clips · {fmt_dur(seconds)} · {len(plan)} episode(s)"),
+        ("Output", ("audio .wav" if mode == "audio" else "video .mkv") + (", one strip" if output == "strip" else ", clips")
+         + ("" if mode == "audio" else (", accurate cuts" if accurate else ", fast cuts"))),
+        ("Effects", ", ".join(fx.EFFECTS[e] for e in fx.ORDER if e in effects) or f"[{ui.DIM}]none[/]"),
+        ("Audio track", lang or f"track {idx}"),
+        ("Save to", str(args.out.resolve() / f"{safe_name(name)}_{mode}_{output}")),
+    ], "Ready")
+    if not args.yes and ui.interactive() and not ui.confirm("Start?", True):
+        raise ui.Cancelled
 
     outdir = extract(args, plan, name, mode, output, accurate, effects, audio_pref)
-    print(f"\nDone: {outdir}")
+    ui.console.print()
+    ui.panel([("Clips", f"{count} · {fmt_dur(seconds)}"), ("Folder", str(outdir.resolve())),
+              ("Transcripts", "metadata.tsv")], "Done", color="green")
+    if ui.interactive() and not args.yes and shutil.which("xdg-open") and ui.confirm("Open the folder?", False):
+        subprocess.Popen(["xdg-open", str(outdir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

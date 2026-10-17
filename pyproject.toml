@@ -1,10 +1,10 @@
 [project]
 name = "waifu-extractor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cut one character's voice or scenes out of anime episodes, using subtitle tracks that name the speaker."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pysubs2>=1.7"]
+dependencies = ["pysubs2>=1.7", "rich>=13", "inquirerpy>=0.3.4"]
 
 [project.optional-dependencies]
 # audio-separator 0.47 imports onnxruntime and audioread without declaring them

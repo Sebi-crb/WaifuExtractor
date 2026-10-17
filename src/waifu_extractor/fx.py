@@ -12,6 +12,7 @@ import subprocess
 import sys
 import wave
 from pathlib import Path
+from typing import Callable
 
 from .cutter import run, write_wav
 from .segments import Segment
@@ -90,7 +91,7 @@ def _spans(segs: list[Segment], offset: float, rate: int, nframes: int) -> list[
 
 
 def process_excerpts(wav: Path, segs: list[Segment], offset: float, effects: set[str],
-                     workdir: Path, mono: bool, label: str = "") -> Path:
+                     workdir: Path, mono: bool, status: Callable[[str], None] = lambda _: None) -> Path:
     """Run the separation models only over the parts of the episode that get cut.
 
     The models run at roughly real time on a mid-range GPU, so a whole episode per model is far too
@@ -110,7 +111,7 @@ def process_excerpts(wav: Path, segs: list[Segment], offset: float, effects: set
     # Music removal first: de-reverb models are trained on isolated vocals.
     for effect in ("music", "dereverb"):
         if effect in effects:
-            print(f"  {label}: {EFFECTS[effect].lower()} on {minutes:.1f} min of audio (AI model)...", flush=True)
+            status(f"{EFFECTS[effect].lower()} on {minutes:.1f} min of audio (AI model)")
             processed = separate(excerpt, effect, workdir, mono)
             excerpt.unlink()
             excerpt = processed

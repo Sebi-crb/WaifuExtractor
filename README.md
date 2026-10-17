@@ -45,18 +45,28 @@ waifu-extract ep01.mkv -c Aqua -m audio -O clips -y
 waifu-extract "/path/to/show" -c Kaz,Kazuma -m video -O strip --fast
 ```
 
-Interactive mode asks, in order: character (several spelling variants can be picked at
-once, and it offers similar names like *Kaz* / *Kazuma*), audio or video, clips or strip,
-fast or accurate video cuts, audio effects and the audio track (Japanese by default).
+Run it with no options (or just a path) for the interactive mode: arrow-key menus,
+checkboxes, and a fuzzy-search list for characters. It asks, in order:
 
-The effects menu is a checklist of three; effects that aren't installed are marked:
+1. **Character**: type to search, Tab to tick several (spelling variants like *Kaz* +
+   *Kazuma*). Close spellings are offered afterwards, already ticked.
+2. **Audio or video**, then **clips or one strip**.
+3. **Accurate or fast** video cuts (video only).
+4. **Audio effects** (checklist, see below).
+5. **Audio track** (Japanese preselected).
+
+A summary panel shows what will happen before anything starts; progress bars show each
+episode's current step. Every question has a matching flag (`--help`), and with
+`-y` plus flags it runs without asking anything, e.g. in scripts.
+
+The effects checklist has three options; ones that aren't installed are listed greyed out:
 
 - **Remove music and sound effects** (`--remove-music`)
 - **Remove reverb and echo** (`--dereverb`)
 - **Normalize loudness** (`--normalize`, target `--loudness -20` LUFS): two-pass loudnorm
   per clip, so every clip has the same volume.
 
-Effects also apply to video output: the clip gets the processed soundtrack. Each question has a matching flag, see `--help`.
+Effects also apply to video output: the clip gets the processed soundtrack.
 
 Output lands in `./waifu-extract/<Character>_<audio|video>_<clips|strip>/` together with
 `metadata.tsv`: source episode, timestamps and the subtitle text of every clip, which
