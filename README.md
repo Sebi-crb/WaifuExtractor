@@ -90,4 +90,16 @@ which is slow over network shares. Extracted subtitles are cached in
   neighbouring sound; `--remove-music` and `--min-length` help for voice datasets.
 - Timings match the audio the subtitles were made for (usually Japanese); the dub can drift.
 
+## Known issues
+
+- **beartype pin (Python 3.14).** `audio-separator` 0.47 requires `beartype<0.19`, but that version
+  can't load the Roformer models on Python 3.14 (`type hint collections.abc.Callable | None either
+  PEP-noncompliant or currently unsupported by @beartype`). Install `beartype>=0.22` over the pin
+  (see the fx install steps). `uv tool upgrade` or a reinstall puts the old version back, so redo
+  that step afterwards. Python 3.13 and older aren't affected.
+- **Undeclared dependencies.** `audio-separator` imports `onnxruntime` and `audioread` without
+  listing them; the `[fx]` extra adds both.
+- **Separation speed.** The models run at roughly real time on a mid-range GPU (RX 6650 XT), so
+  they only process the parts of each episode that get cut, plus 1 s on each side.
+
 Only use it on media you own.
