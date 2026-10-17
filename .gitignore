@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+uv.lock
+# Never commit extracted media or subtitles
+waifu-extract/
+*.mkv
+*.wav
+*.ass
+*.srt

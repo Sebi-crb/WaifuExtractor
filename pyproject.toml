@@ -1,0 +1,17 @@
+[project]
+name = "waifu-extractor"
+version = "0.1.0"
+description = "Cut one character's voice or scenes out of anime episodes, using subtitle tracks that name the speaker."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pysubs2>=1.7"]
+
+[project.optional-dependencies]
+vocals = ["demucs>=4.0"]
+
+[project.scripts]
+waifu-extract = "waifu_extractor.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
