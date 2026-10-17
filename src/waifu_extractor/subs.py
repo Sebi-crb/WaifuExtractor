@@ -20,6 +20,8 @@ JUNK_NAMES = {"sign", "signs", "song", "songs", "op", "ed", "note", "tl note", "
 # "Aqua & Kazuma", "Aqua/Kazuma", "Aqua and Kazuma" -> several speakers on one line.
 SPEAKER_SPLIT = re.compile(r"\s*(?:&|/|\+|,|\band\b)\s*", re.I)
 OVERRIDE_TAG = re.compile(r"\{[^}]*\}")
+# Karaoke timing tags (\k, \kf, \ko, \K) only appear in song lines.
+KARAOKE_TAG = re.compile(r"\\[kK][fo]?\d")
 
 
 @dataclass(frozen=True)
@@ -81,7 +83,8 @@ def parse_track(path: Path) -> list[Line]:
         return []
     lines = []
     for ev in subs.events:
-        if ev.is_comment or ev.end <= ev.start:
+        # Karaoke templater output sets Effect ("fx", "template", ...); dialogue leaves it empty.
+        if ev.is_comment or ev.end <= ev.start or ev.effect.strip() or KARAOKE_TAG.search(ev.text):
             continue
         name = ev.name.strip()
         if not name or name.isdigit() or name.startswith("[") or name.casefold() in JUNK_NAMES:
