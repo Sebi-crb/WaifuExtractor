@@ -1,7 +1,7 @@
 [project]
 name = "waifu-extractor"
-version = "0.3.0"
-description = "Cut one character's voice or scenes out of anime episodes, using subtitle tracks that name the speaker."
+version = "0.4.0"
+description = "Cut one character's voice or scenes out of anime episodes, by subtitle speaker names or by her voice."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["pysubs2>=1.7", "rich>=13", "inquirerpy>=0.3.4"]
@@ -9,6 +9,8 @@ dependencies = ["pysubs2>=1.7", "rich>=13", "inquirerpy>=0.3.4"]
 [project.optional-dependencies]
 # audio-separator 0.47 imports onnxruntime and audioread without declaring them
 fx = ["audio-separator>=0.47", "onnxruntime", "audioread"]
+# Voice matching for episodes whose subs don't name the speakers (WeSpeaker fingerprints, Silero VAD)
+voice = ["numpy", "onnxruntime", "scikit-learn", "silero-vad>=5", "torch"]
 
 [project.scripts]
 waifu-extract = "waifu_extractor.cli:main"

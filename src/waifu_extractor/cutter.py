@@ -131,6 +131,12 @@ def cut_video(
     run(cmd + ["-avoid_negative_ts", "make_zero", "-sn", "-dn", str(out)])
 
 
+def swap_audio(clip: Path, audio_file: Path, out: Path) -> None:
+    """A copy of a cut video clip with another soundtrack (a wav starting where the clip starts)."""
+    run(["ffmpeg", "-v", "error", "-y", "-i", str(clip), "-i", str(audio_file), "-map", "0:v:0", "-map", "1:a:0",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)])
+
+
 def duration(path: Path) -> float:
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
                          capture_output=True, text=True, check=True)

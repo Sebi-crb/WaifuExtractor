@@ -132,11 +132,24 @@ def progress(transient: bool = False) -> Progress:
 # --- prompts -------------------------------------------------------------------
 # Ctrl+C in any prompt raises KeyboardInterrupt, handled once in cli.main.
 
-def select(message: str, choices: Sequence[tuple[Any, str]], default: Any = None) -> Any:
-    return inquirer.select(
-        message, [Choice(value, name=title) for value, title in choices], default=default,
-        instruction="↑↓ Enter", max_height="60%", transformer=_short, **COMMON,
-    ).execute()
+def select(message: str, choices: Sequence[tuple[Any, str]], default: Any = None, *,
+           keys: dict[str, Callable[[Any], None]] | None = None, instruction: str = "↑↓ Enter",
+           notes: dict[Any, list[str]] | None = None) -> Any:
+    """Arrow-key menu. `keys` maps extra keys (e.g. "tab") to a function of the highlighted choice's value;
+    `notes` adds dim rows under a choice that the cursor skips."""
+    opts: list[Any] = []
+    for value, title in choices:
+        opts.append(Choice(value, name=title))
+        opts += [Separator(note) for note in (notes or {}).get(value, [])]
+    prompt = inquirer.select(
+        message, opts, default=default,
+        instruction=instruction, max_height="60%", transformer=_short,
+        # Tab/Shift+Tab tick-and-move by default (a no-op tick here) and would win over our own keys
+        keybindings={"toggle-down": [], "toggle-up": []} if keys else None, **COMMON,
+    )
+    for key, action in (keys or {}).items():
+        prompt.register_kb(key)(lambda _event, act=action: act(prompt.content_control.selection["value"]))
+    return prompt.execute()
 
 
 def checkbox(message: str, choices: Sequence[tuple[Any, str]], *, checked: set = frozenset(),

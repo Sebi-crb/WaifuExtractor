@@ -25,6 +25,8 @@ class Segment:
     start: float
     end: float
     text: str
+    score: float | None = None  # voice-match probability; None when the subs named the speaker
+    check: bool = False  # might be someone else: kept apart for listening
 
     @property
     def duration(self) -> float:
@@ -81,6 +83,38 @@ def build_segments(
             merged[-1].text += " " + line.text
         else:
             merged.append(Segment(start, end, line.text))
+    return merged
+
+
+# Voice-match cut-offs, measured on KonoSuba S1 with the names hidden: 0.8+ was her ~90-98 % of the time,
+# 0.5-0.8 about a quarter to a half, below 0.5 under one in ten.
+VOICE_SURE = 0.8
+VOICE_CHECK = 0.5
+# Learning from reference clips alone gives lower scores for the same certainty: 0.7+ was her 88-100 %
+# of the time, 0.3-0.7 about a third to all of it, depending on the character.
+REF_SURE = 0.7
+REF_CHECK = 0.3
+
+
+def voice_segments(spans: list[tuple[float, float, str]], scores: list[float], unsure: list[bool], *,
+                   pad: float = 0.1, merge_gap: float = 0.3, sure: float = VOICE_SURE,
+                   low: float = VOICE_CHECK) -> list[Segment]:
+    """Voice-matched speech -> padded segments. Below `low` is dropped; below `sure`, or overlapped by
+    another line, it's kept for checking. Neighbours are joined like named lines, but only when both
+    have the same verdict; a joined clip keeps the lower score."""
+    merged: list[Segment] = []
+    for (a, b, text), score, overlapped in sorted(zip(spans, scores, unsure)):
+        if not score >= low:  # also skips NaN: speech too short to fingerprint
+            continue
+        check = score < sure or overlapped
+        start, end = max(0.0, a - pad), b + pad
+        last = merged[-1] if merged else None
+        if last and last.check == check and start - last.end <= merge_gap:
+            last.end = max(last.end, end)
+            last.text = f"{last.text} {text}".strip()
+            last.score = min(last.score, score)
+        else:
+            merged.append(Segment(start, end, text, score, check))
     return merged
 
 

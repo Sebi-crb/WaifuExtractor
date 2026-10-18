@@ -27,6 +27,8 @@ EFFECTS = {
     "normalize": "Normalize loudness",
 }
 ORDER = ["music", "dereverb", "normalize"]
+# Folder names when every step is saved: what the clips are after that effect.
+STEP_NAMES = {"music": "no-music", "dereverb": "no-reverb", "normalize": "normalized"}
 SEPARATIONS = {"music", "dereverb"}
 
 # effect -> (model file, regex matching the stem we keep in audio-separator's output names)
@@ -91,12 +93,14 @@ def _spans(segs: list[Segment], offset: float, rate: int, nframes: int) -> list[
 
 
 def process_excerpts(wav: Path, segs: list[Segment], offset: float, effects: set[str],
-                     workdir: Path, mono: bool, status: Callable[[str], None] = lambda _: None) -> Path:
+                     workdir: Path, mono: bool, status: Callable[[str], None] = lambda _: None,
+                     every_step: bool = False) -> list[Path]:
     """Run the separation models only over the parts of the episode that get cut.
 
     The models run at roughly real time on a mid-range GPU, so a whole episode per model is far too
     slow when a character speaks for a few minutes. The processed audio is written back at its
     original position in an episode-length wav (silence elsewhere), so cutting works unchanged.
+    Returns that wav after the last model, or with `every_step` one after each model, in order.
     """
     with wave.open(str(wav), "rb") as w:
         params = w.getparams()
@@ -109,14 +113,21 @@ def process_excerpts(wav: Path, segs: list[Segment], offset: float, effects: set
     write_wav(excerpt, params, b"".join(chunks))
     minutes = sum(b - a for a, b in spans) / params.framerate / 60
     # Music removal first: de-reverb models are trained on isolated vocals.
-    for effect in ("music", "dereverb"):
-        if effect in effects:
-            status(f"{EFFECTS[effect].lower()} on {minutes:.1f} min of audio (AI model)")
-            processed = separate(excerpt, effect, workdir, mono)
-            excerpt.unlink()
-            excerpt = processed
+    steps = [e for e in ("music", "dereverb") if e in effects]
+    outs = []
+    for effect in steps:
+        status(f"{EFFECTS[effect].lower()} on {minutes:.1f} min of audio (AI model)")
+        processed = separate(excerpt, effect, workdir, mono)
+        excerpt.unlink()
+        excerpt = processed
+        if every_step or effect == steps[-1]:
+            outs.append(_put_back(excerpt, spans, params, wav.with_name(f"{wav.stem}.{effect}.wav")))
+    excerpt.unlink()
+    return outs
 
-    out = wav.with_name(f"{wav.stem}.fx.wav")
+
+def _put_back(excerpt: Path, spans: list[list[int]], params: wave._wave_params, out: Path) -> Path:
+    """Processed excerpt -> episode-length wav with each span back at its place."""
     frame = params.nchannels * params.sampwidth
     with wave.open(str(excerpt), "rb") as src, wave.open(str(out), "wb") as dst:
         dst.setparams(params)
@@ -128,7 +139,6 @@ def process_excerpts(wav: Path, segs: list[Segment], offset: float, effects: set
             dst.writeframes(data[:(b - a) * frame])
             pos = b
         dst.writeframes(b"\0" * ((params.nframes - pos) * frame))
-    excerpt.unlink()
     return out
 
 
